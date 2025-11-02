@@ -1,0 +1,15 @@
+gradio==5.49.1
+numpy
+pandas
+openai
+notebook
+torch
+transformers
+scikit-learn
+sentence-transformers
+tqdm
+faiss-cpu
+langchain
+langchain-openai
+langchain-community
+kagglehub
