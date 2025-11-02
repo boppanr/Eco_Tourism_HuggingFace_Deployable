@@ -1,33 +1,109 @@
-import os
 import gradio as gr
-from pipeline import run_all, SEED
-import subprocess, sys
+import pickle
+import faiss
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.docstore.in_memory import InMemoryDocstore
+from langchain_core.documents import Document
+from transformers import pipeline
 
-def run_pipeline_and_capture(env_vars=None):
+# ---------------------------------------------------------
+# STEP 1: Load FAISS index and metadata
+# ---------------------------------------------------------
+print("🔹 Loading dataset...")
+
+with open("eco_tourism_meta.pkl", "rb") as f:
+    meta_data = pickle.load(f)
+
+if isinstance(meta_data, list):
+    print(f"✅ Loaded metadata list with {len(meta_data)} entries")
+else:
+    print("⚠️ Metadata format not list; proceeding anyway")
+
+print("🔹 Loading FAISS index...")
+index = faiss.read_index("index.faiss")
+
+with open("index.pkl", "rb") as f:
+    store_data = pickle.load(f)
+
+embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+docs = []
+for d in meta_data:
+    if isinstance(d, str):
+        docs.append(Document(page_content=d))
+    elif isinstance(d, dict) and "page_content" in d:
+        docs.append(Document(page_content=d["page_content"]))
+    else:
+        docs.append(Document(page_content=str(d)))
+
+docstore = InMemoryDocstore({str(i): doc for i, doc in enumerate(docs)})
+index_to_docstore_id = {i: str(i) for i in range(len(docs))}
+
+vectorstore = FAISS(
+    embedding_function=embedding_model,
+    index=index,
+    docstore=docstore,
+    index_to_docstore_id=index_to_docstore_id,
+)
+print("✅ Vector store ready!")
+
+# ---------------------------------------------------------
+# STEP 2: Initialize small lightweight LLM
+# ---------------------------------------------------------
+print("🔹 Initializing lightweight FLAN-T5 model...")
+
+llm_pipeline = pipeline(
+    "text2text-generation",
+    model="google/flan-t5-base",  # lightweight & CPU friendly
+    max_new_tokens=256,
+)
+print("✅ FLAN-T5 ready!")
+
+
+# ---------------------------------------------------------
+# STEP 3: Define query function
+# ---------------------------------------------------------
+def answer_query(query):
     try:
-        env = os.environ.copy()
-        if env_vars:
-            env.update(env_vars)
-        proc = subprocess.Popen([sys.executable, 'pipeline.py'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
-        out, _ = proc.communicate(timeout=300)
-        return out[:20000] if out else 'No output'
+        results = vectorstore.similarity_search(query, k=3)
+        context = "\n".join([doc.page_content for doc in results])
+
+        prompt = f"""
+You are an eco-tourism expert. Use the context below to answer the question accurately.
+
+CONTEXT:
+{context}
+
+QUESTION:
+{query}
+
+ANSWER:
+"""
+        response = llm_pipeline(prompt)[0]["generated_text"]
+        return response.strip()
     except Exception as e:
-        return f'Error running pipeline: {e}'
+        return f"⚠️ Error: {str(e)}"
 
-def run_and_return(query, seed=SEED):
-    env_vars = {'REVIEW_GENIE_SEED': str(int(seed)), 'USER_QUERY': str(query)}
-    txt = run_pipeline_and_capture(env_vars=env_vars)
-    return txt
 
-with gr.Blocks() as demo:
-    gr.Markdown('# Review Genie — Eco Tourism demo (auto-generated)')
-    with gr.Row():
-        seed = gr.Number(value=int(os.environ.get('REVIEW_GENIE_SEED', 42)), label='Deterministic seed', interactive=True)
-        query = gr.Textbox(lines=1, placeholder='Enter a question (e.g. "what location has the top visitors?")', label='Query')
-    btn = gr.Button('Run pipeline (deterministic)')
-    out = gr.Textbox(label='Pipeline output (truncated)', lines=20)
-    btn.click(run_and_return, inputs=[query, seed], outputs=[out])
-    gr.Markdown('Auto-generated deployable. Edit pipeline.py for production.')
+# ---------------------------------------------------------
+# STEP 4: Gradio Web UI
+# ---------------------------------------------------------
+def chat_interface(message, history):
+    response = answer_query(message)
+    history.append((message, response))
+    return history, history
 
-if __name__ == '__main__':
-    demo.launch(server_name='0.0.0.0', server_port=int(os.environ.get('PORT', 7860)))
+
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown("## 🌿 EcoTourism AI Assistant (Lightweight)")
+    gr.Markdown("Ask about sustainable travel, eco-destinations, or green tourism tips!")
+
+    chatbot = gr.Chatbot(height=500)
+    msg = gr.Textbox(label="Your question:")
+    clear = gr.Button("Clear Chat")
+
+    msg.submit(chat_interface, [msg, chatbot], [chatbot, chatbot])
+    clear.click(lambda: None, None, chatbot, queue=False)
+
+demo.launch(server_name="0.0.0.0", server_port=7860)
